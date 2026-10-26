@@ -41,7 +41,7 @@ Other ways in:
 
 - From GitHub's newest release, without PyPI:
   `pip install https://github.com/jeremy-morren/download-apk/releases/latest/download/download-apk.tar.gz`.
-- A specific release: `pip install download-apk==0.1.0`, or the wheel attached to that release on
+- A specific release: `pip install download-apk==0.2.0`, or the wheel attached to that release on
   GitHub.
 - The newest commit on `main`: `pip install git+https://github.com/jeremy-morren/download-apk`.
 
@@ -87,7 +87,7 @@ version, so older versions can't be downloaded. Paid apps download only if the a
 | `--sign-in`       |                      | Sign in again, replacing the saved credentials   |
 | `--email ADDRESS` | asked for            | The Google account's email, used when signing in |
 | `--country CODE`  | detected             | The store country for search and version lookups |
-| `--lang CODE`     | `en`                 | The store language                               |
+| `--lang CODE`     | detected             | The store language, e.g. `en` or `en-GB`         |
 
 Without `--country`, the country is where your IP address is, which is also where Google Play places
 you. It's looked up from Cloudflare's trace endpoint (`https://www.cloudflare.com/cdn-cgi/trace`), or
@@ -96,6 +96,14 @@ Offline, it falls back to your system's region setting, then to `us`. Every run 
 
 ```
 Determined Google Play country 'vc' from your IP address; use --country to override.
+```
+
+Without `--lang`, the language is your system's display language: on Windows, the Windows display
+language; on Linux and macOS, `LC_ALL`, `LC_MESSAGES` or `LANG`. It falls back to `en`, and is logged
+the same way:
+
+```
+Determined Google Play language 'en-GB' from your system's display language; use --lang to override.
 ```
 
 ## Signing in
@@ -152,20 +160,37 @@ folder.
 ### Releasing
 
 GitHub Actions tests every push and pull request on Windows and Linux, with the oldest and newest
-supported Python, and builds the package on each of those four machines. The builds must be
-byte-identical. Then, for a push to `main`:
+supported Python, then builds the package on Linux and checks that both files install and run. For a
+push to `main`:
 
 1. Raise `version` in `pyproject.toml` and `__version__` in `src/download_apk/__init__.py`; a test
    fails if they differ.
 2. Push to `main`. `ci.yml` creates a draft release `v<version>` with two files: the wheel, and the
-   source tarball as `download-apk.tar.gz`. If that release already exists it does nothing; if only a
-   tag is left from a deleted release, it deletes the tag first.
-3. Review the draft on GitHub and publish it. That creates the tag, and `release.yml` rebuilds the
-   wheel from the tag, checks it is byte-identical to the release's wheel, and uploads it to PyPI.
+   source tarball as `download-apk.tar.gz`, both attested (see below). If that release already exists
+   it does nothing; if only a tag is left from a deleted release, it deletes the tag first.
+3. Review the draft on GitHub and publish it. That creates the tag, and `release.yml` uploads the
+   release's wheel to PyPI.
 
 PyPI accepts the upload through trusted publishing: its publisher settings for `download-apk` name
 this repository, the workflow `release.yml` and the GitHub environment `pypi`, so no PyPI token is
 stored anywhere. A version can be uploaded to PyPI only once, even if it is later deleted there.
+
+### Verifying a download
+
+Every file is signed with a record of where it was built: which repository, workflow and commit.
+
+- **GitHub release files** carry a GitHub artifact attestation:
+
+  ```
+  gh attestation verify download-apk.tar.gz --repo jeremy-morren/download-apk
+  ```
+
+- **PyPI files** carry a PyPI attestation, made by the upload: the file's page on pypi.org shows it,
+  and `pypi-attestations verify pypi --repository https://github.com/jeremy-morren/download-apk
+  pypi:download_apk-0.2.0-py3-none-any.whl` checks it.
+
+Both are signed through Sigstore with a certificate GitHub issues to the workflow run, so no key is
+kept anywhere. For a stronger check, rebuild the release yourself (next section).
 
 ### Reproducible builds
 
@@ -173,7 +198,7 @@ Building the same commit on Linux gives byte-identical files, so anyone can chec
 its source:
 
 ```
-git clone https://github.com/jeremy-morren/download-apk && cd download-apk && git checkout v0.1.0
+git clone https://github.com/jeremy-morren/download-apk && cd download-apk && git checkout v0.2.0
 python -m build
 sha256sum dist/*       # compare with the SHA-256 values in the release notes
 ```

@@ -1,4 +1,4 @@
-"""Which Google Play country to use when --country isn't given."""
+"""Which Google Play country and language to use when --country or --lang isn't given."""
 
 import os
 import re
@@ -11,11 +11,17 @@ import urllib.request
 CLOUDFLARE_TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 IPINFO_COUNTRY_URL = "https://ipinfo.io/country"
 FALLBACK_COUNTRY = "us"
+FALLBACK_LANGUAGE = "en"
 
 _COUNTRY_CODE = re.compile(r"^[A-Za-z]{2}$")
 _UNKNOWN_COUNTRIES = {"xx"}  # Cloudflare's "unknown"; Tor is "T1", which isn't two letters anyway
 # A POSIX locale such as en_AU.UTF-8: language, then the territory.
 _LOCALE_TERRITORY = re.compile(r"^[A-Za-z]{2,3}_(?P<territory>[A-Za-z]{2})(?:[.@]|$)")
+# A language tag as Windows (en-GB, zh-Hant-TW) or POSIX (pt_BR.UTF-8) writes it: the language, any script,
+# then an optional region of two letters or three digits.
+_LANGUAGE_TAG = re.compile(
+    r"^(?P<language>[A-Za-z]{2,3})(?:[-_][A-Za-z]{4})?(?:[-_](?P<region>[A-Za-z]{2}|[0-9]{3}))?(?:[.@-]|$)"
+)
 
 
 def detect_country() -> tuple[str, str]:
@@ -26,6 +32,33 @@ def detect_country() -> tuple[str, str]:
     if country := country_from_os():
         return country, "your system's region setting"
     return FALLBACK_COUNTRY, "a fallback, since neither your IP address nor your system said"
+
+
+def detect_language() -> tuple[str, str]:
+    """The language to use and where it came from: the system's display language, else a fallback."""
+    if language := language_from_os():
+        return language, "your system's display language"
+    return FALLBACK_LANGUAGE, "a fallback, since your system didn't say"
+
+
+def language_tag(value: str) -> str | None:
+    """A language tag as Google Play takes it, language-REGION (en-GB, pt-BR, zh-TW) or just the language;
+    None for anything else, including the POSIX "C" locale. Script subtags are dropped."""
+    match = _LANGUAGE_TAG.match(value.strip())
+    if not match:
+        return None
+    language = match["language"].lower()
+    return f"{language}-{match['region'].upper()}" if match["region"] else language
+
+
+def language_from_os() -> str | None:
+    if sys.platform == "win32":
+        return _windows_display_language()
+    for variable in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        value = os.environ.get(variable, "")
+        if value and value.split(".")[0] not in ("C", "POSIX"):
+            return language_tag(value)
+    return None
 
 
 def country_from_ip(timeout: float = 3) -> str | None:
@@ -60,6 +93,20 @@ def _fetch(url: str, timeout: float) -> str | None:
             return response.read(4096).decode("ascii", errors="replace")
     except (OSError, ValueError):  # offline, blocked, timed out (URLError and timeouts are OSErrors)
         return None
+
+
+def _windows_display_language() -> str | None:
+    """Settings > Time & language > Language > Windows display language, e.g. en-GB."""
+    import ctypes
+
+    try:
+        kernel32 = ctypes.windll.kernel32
+        buffer = ctypes.create_unicode_buffer(85)  # LOCALE_NAME_MAX_LENGTH
+        if not kernel32.LCIDToLocaleName(kernel32.GetUserDefaultUILanguage(), buffer, len(buffer), 0):
+            return None
+    except (AttributeError, OSError):
+        return None
+    return language_tag(buffer.value)
 
 
 def _windows_region() -> str | None:

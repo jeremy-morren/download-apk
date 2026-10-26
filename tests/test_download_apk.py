@@ -4,12 +4,14 @@ Nothing here signs in to Google or downloads an APK: apkeep, sign-in and Google 
 replaced with fakes, and the APKs are generated with a minimal binary AndroidManifest.xml.
 """
 
+import io
 import json
 import os
 import re
 import shutil
 import struct
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -231,9 +233,10 @@ def test_write_metadata_hashes_every_file(tmp_path):
 # ----------------------------------------------------------------------------------------- cli.py ---
 @pytest.fixture(autouse=True)
 def no_country_lookup(monkeypatch, request):
-    """Tests never contact the IP lookup service unless marked real_location."""
+    """Tests never contact the IP lookup service or read the machine's settings unless marked real_location."""
     if "real_location" not in request.keywords:
         monkeypatch.setattr(cli, "detect_country", lambda: ("zz", "a test"))
+        monkeypatch.setattr(cli, "detect_language", lambda: ("en", "a test"))
 
 
 @pytest.mark.parametrize("app_id", ["com.example.app", "org.mozilla.firefox", "com.Example99.my_app", "a.b"])
@@ -641,6 +644,92 @@ def test_cli_logs_an_overridden_country_without_detecting(monkeypatch, quiet_cli
     cli.main(["--country", "AU", "search", "firefox"])
     assert quiet_cli == ["au"]
     assert "Using Google Play country 'au' (from --country)" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("en-GB", "en-GB"), ("en_AU.UTF-8", "en-AU"), ("pt_BR", "pt-BR"), ("FR", "fr"), ("zh-Hant-TW", "zh-TW"),
+        ("sr-Latn-RS", "sr-RS"), ("es-419", "es-419"), ("de_DE@euro", "de-DE"),
+        ("C", None), ("english", None), ("e", None), ("", None),
+    ],
+)
+def test_language_tag_normalises_windows_and_posix_forms(value, expected):
+    assert location.language_tag(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({"LANG": "en_AU.UTF-8"}, "en-AU"),
+        ({"LC_ALL": "fr_CA.UTF-8", "LANG": "en_US.UTF-8"}, "fr-CA"),
+        ({"LC_MESSAGES": "pt_BR"}, "pt-BR"),
+        ({"LANG": "C.UTF-8"}, None),
+        ({"LANG": "POSIX"}, None),
+        ({}, None),
+    ],
+)
+def test_language_from_os_reads_the_posix_locale(monkeypatch, env, expected):
+    monkeypatch.setattr(location.sys, "platform", "linux")
+    for variable in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        monkeypatch.delenv(variable, raising=False)
+    for variable, value in env.items():
+        monkeypatch.setenv(variable, value)
+    assert location.language_from_os() == expected
+
+
+def test_detect_language_falls_back_to_english(monkeypatch):
+    monkeypatch.setattr(location, "language_from_os", lambda: None)
+    assert location.detect_language()[0] == "en"
+
+
+@pytest.mark.parametrize(("value", "expected"), [("en", "en"), ("en_gb", "en-GB"), ("PT-br", "pt-BR")])
+def test_lang_arg_accepts_language_tags(value, expected):
+    assert cli.lang_arg(value) == expected
+
+
+@pytest.mark.parametrize("value", ["english", "e", "12", "C"])
+def test_lang_arg_rejects_anything_else(value):
+    with pytest.raises(Exception):
+        cli.lang_arg(value)
+
+
+@pytest.fixture
+def searched(monkeypatch, tmp_path):
+    """Runs cli.main with git and sign-in replaced; returns the (country, language) searches used."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "warn_if_tracked_by_git", lambda ini: None)
+    monkeypatch.setattr(cli, "ensure_signed_in", lambda *a: None)
+    seen = []
+    monkeypatch.setattr(cli, "search", lambda term, limit, country, lang: seen.append((country, lang)))
+    return seen
+
+
+def test_cli_logs_the_detected_language(monkeypatch, searched, capsys):
+    monkeypatch.setattr(cli, "detect_language", lambda: ("en-GB", "your system's display language"))
+    cli.main(["search", "firefox"])
+    assert searched == [("zz", "en-GB")]
+    assert "Determined Google Play language 'en-GB' from your system's display language" in capsys.readouterr().err
+
+
+def test_cli_logs_an_overridden_language_without_detecting(monkeypatch, searched, capsys):
+    monkeypatch.setattr(cli, "detect_language", lambda: pytest.fail("detected despite --lang"))
+    cli.main(["--lang", "pt_br", "search", "firefox"])
+    assert searched == [("zz", "pt-BR")]
+    assert "Using Google Play language 'pt-BR' (from --lang)" in capsys.readouterr().err
+
+
+def test_output_the_console_cannot_show_is_replaced_not_fatal(monkeypatch, tmp_path):
+    """A Windows console or pipe using cp1252 can't encode a Chinese app title."""
+    stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "warn_if_tracked_by_git", lambda ini: None)
+    monkeypatch.setattr(cli, "ensure_signed_in", lambda *a: None)
+    monkeypatch.setattr(cli, "search", lambda *a: print("com.tencent.mm  微信"))
+    cli.main(["--country", "cn", "--lang", "zh-CN", "search", "wechat"])
+    stdout.flush()
+    assert stdout.buffer.getvalue() == b"com.tencent.mm  ??" + os.linesep.encode()
 
 
 # --------------------------------------------------------------------------------------- live checks ---

@@ -72,6 +72,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write           # signs the attestation with a certificate for this workflow run
+      attestations: write       # stores it with the repository
+      artifact-metadata: write  # records the attested files
     concurrency:
       group: release
       cancel-in-progress: false
@@ -119,10 +122,9 @@ jobs:
             echo "No tag $TAG to clean up."
           fi
 
-      - name: Create the draft release
+      - name: Prepare the release files and notes
         if: steps.existing.outputs.exists == 'false'
         env:
-          TAG: ${{ steps.version.outputs.tag }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           # Two assets:
@@ -142,7 +144,27 @@ jobs:
             echo
             echo "Built on Linux. Rebuilding the tag on Linux with \`python -m build\` gives the same bytes."
             echo "\`download-apk.tar.gz\` is \`download_apk-$VERSION.tar.gz\` renamed."
+            echo
+            echo "Both files carry a signed build provenance attestation. To check where a file was built:"
+            echo
+            echo '```'
+            echo "gh attestation verify <file> --repo $GITHUB_REPOSITORY"
+            echo '```'
           } > notes.md
+
+      # A signed statement (SLSA build provenance, through Sigstore) that these exact files were built by
+      # this workflow run, from this commit, in this repository. Free for public repositories.
+      - name: Attest the release files
+        if: steps.existing.outputs.exists == 'false'
+        uses: actions/attest@v4
+        with:
+          subject-path: assets/*
+
+      - name: Create the draft release
+        if: steps.existing.outputs.exists == 'false'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
           # The tag is created on the built commit when the draft is published. --notes is prepended to
           # the generated notes (the commits and pull requests since the previous release).
           gh release create "$TAG" assets/* --draft --title "$TAG" --target "$GITHUB_SHA" \

@@ -10,7 +10,7 @@ from pathlib import Path
 from . import __version__
 from .credentials import warn_if_tracked_by_git
 from .google_play import download, ensure_signed_in, search
-from .location import detect_country
+from .location import detect_country, detect_language, language_tag
 
 DEFAULT_INI = ".google-play.ini"
 DEFAULT_OUT = "apps"
@@ -32,6 +32,23 @@ def country_arg(value: str) -> str:
     if not COUNTRY_RE.match(value):
         raise argparse.ArgumentTypeError(f"{value!r} is not a two-letter country code, e.g. au")
     return value.lower()
+
+
+def lang_arg(value: str) -> str:
+    tag = language_tag(value)
+    if tag is None:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a language code, e.g. en or en-GB")
+    return tag
+
+
+def store_language(given: str | None) -> str:
+    """The Google Play language: --lang if given, else the system's display language. Logged either way."""
+    if given:
+        log(f"Using Google Play language '{given}' (from --lang).")
+        return given
+    language, source = detect_language()
+    log(f"Determined Google Play language '{language}' from {source}; use --lang to override.")
+    return language
 
 
 def store_country(given: str | None) -> str:
@@ -61,7 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--email", help="Google account email (prompted for when signing in otherwise)")
     parser.add_argument("--country", type=country_arg,
                         help="two-letter store country code (default: detected from your IP address)")
-    parser.add_argument("--lang", default="en", help="store language (default en)")
+    parser.add_argument("--lang", type=lang_arg,
+                        help="store language, e.g. en or en-GB (default: your system's display language)")
     commands = parser.add_subparsers(dest="command", required=True)
 
     p = commands.add_parser("search", help="search Google Play")
@@ -76,16 +94,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # A title the console can't show (Chinese on a Windows console using cp1252, say) prints as "?"
+    # rather than crashing the command.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     args = build_parser().parse_args(argv)
     ini = args.ini.resolve()
     warn_if_tracked_by_git(ini)
     try:
         ensure_signed_in(ini, args.sign_in, args.email)
         country = store_country(args.country)
+        language = store_language(args.lang)
         if args.command == "search":
-            search(args.term, args.limit, country, args.lang)
+            search(args.term, args.limit, country, language)
         else:
-            download(args.app_id, args.out.resolve(), ini, country, args.lang)
+            download(args.app_id, args.out.resolve(), ini, country, language)
     except urllib.error.URLError as error:
         sys.exit(f"Network error: {error.reason}")
     except KeyboardInterrupt:
