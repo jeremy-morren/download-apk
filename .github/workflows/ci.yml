@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install the package and its test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group test
+
+      - name: Run the tests
+        run: python -m pytest
+
+  build:
+    name: Build
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      # hatch_build.py dates every file with the commit and reads the links from `origin`, so rebuilding
+      # this commit on Linux gives the same bytes (see "Reproducible builds" in README.md).
+      - name: Build the wheel and source tarball
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Check that both install and run
+        run: |
+          for package in dist/*.whl dist/*.tar.gz; do
+            python -m venv "/tmp/check-$(basename "$package")"
+            "/tmp/check-$(basename "$package")/bin/pip" install --quiet "$package"
+            "/tmp/check-$(basename "$package")/bin/download-apk" --version
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Create draft release
+    needs: build
+    # Only for main: a pull request must never create a release.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Read the version from pyproject.toml
+        id: version
+        run: |
+          version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          echo "Version $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if the release already exists
+        id: existing
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          # Lists drafts too, since this token can write to the repository.
+          if gh release list --limit 1000 --json tagName --jq '.[].tagName' | grep -qxF "$TAG"; then
+            echo "Release $TAG already exists (published or draft): nothing to do."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Delete the tag left by a deleted release
+        if: steps.existing.outputs.exists == 'false'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh api "repos/$GH_REPO/git/ref/tags/$TAG" --silent 2>/dev/null; then
+            echo "Deleting tag $TAG, which has no release."
+            gh api --method DELETE "repos/$GH_REPO/git/refs/tags/$TAG"
+          else
+            echo "No tag $TAG to clean up."
+          fi
+
+      - name: Create the draft release
+        if: steps.existing.outputs.exists == 'false'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Two assets:
+          # - the wheel under its standard name; publishing the release uploads it to PyPI (release.yml);
+          # - the source tarball under a fixed name, so the newest release installs without a version:
+          #     pip install https://github.com/<owner>/<repo>/releases/latest/download/download-apk.tar.gz
+          #   (pip and uv refuse a wheel whose file name has no real version, so the fixed name is a tarball).
+          mkdir assets
+          cp "dist/download_apk-$VERSION-py3-none-any.whl" assets/
+          cp "dist/download_apk-$VERSION.tar.gz" assets/download-apk.tar.gz
+          {
+            echo "## Files"
+            echo
+            echo '| File | SHA-256 |'
+            echo '|---|---|'
+            (cd assets && sha256sum * | awk '{ printf "| `%s` | `%s` |\n", $2, $1 }')
+            echo
+            echo "Built on Linux. Rebuilding the tag on Linux with \`python -m build\` gives the same bytes."
+            echo "\`download-apk.tar.gz\` is \`download_apk-$VERSION.tar.gz\` renamed."
+          } > notes.md
+          # The tag is created on the built commit when the draft is published. --notes is prepended to
+          # the generated notes (the commits and pull requests since the previous release).
+          gh release create "$TAG" assets/* --draft --title "$TAG" --target "$GITHUB_SHA" \
+            --notes "$(cat notes.md)" --generate-notes

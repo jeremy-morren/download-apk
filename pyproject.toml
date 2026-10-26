@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling==1.32.4"]  # pinned: a different hatchling may build different bytes
+build-backend = "hatchling.build"
+
+[project]
+name = "download-apk"
+version = "0.1.0"
+description = "Search Google Play and download apps' APKs into versioned folders."
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Jeremy Morren" }]
+keywords = ["android", "apk", "google-play", "download", "apkeep"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Utilities",
+]
+# Filled in by hatch_build.py: the README with absolute links, and links pinned to this release's tag.
+dynamic = ["readme", "urls"]
+dependencies = [
+    "google-play-scraper>=1.2.7,<2",  # search, and the current version before a download
+    "patchright>=1.50",               # Google Play sign-in (drives your installed Chrome)
+    "platformdirs>=4",                # where apkeep is cached
+]
+
+[project.scripts]
+download-apk = "download_apk.cli:main"
+
+# hatch_build.py: GitHub links and the README for PyPI, and file dates from the last commit.
+[tool.hatch.metadata.hooks.custom]
+[tool.hatch.build.hooks.custom]
+
+[dependency-groups]
+test = ["pytest>=8", "hatchling==1.32.4"]  # hatchling: the tests import hatch_build.py
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "-m", "not network"]
+markers = [
+    "network: talks to Google Play or the IP lookup service over the internet; run with -m network",
+    "real_location: uses the real country detection instead of the tests' fake",
+]
