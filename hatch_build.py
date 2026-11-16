@@ -1,7 +1,15 @@
-"""Build hooks: repository links in the package metadata, and file dates from the git commit.
+"""Build hooks: repository links in the package metadata, file dates from the git commit, and apkeep
+compiled into the wheel.
 
 Hatchling runs both while building (see [tool.hatch.*.hooks.custom] in pyproject.toml). Both read git:
 the repository from the `origin` remote, and the time of the last commit.
+
+The build hook also compiles EFF's apkeep (https://github.com/EFForg/apkeep), a Rust program, from
+crates.io with `cargo install`, and puts it in the wheel at download_apk/bin/. That makes the wheel
+specific to the platform it was built on, so it is tagged py3-none-<platform> (any Python 3, no Python
+ABI, this OS and CPU) instead of py3-none-any. Building a wheel therefore needs Rust's cargo; the
+source tarball holds no binary. An editable install compiles apkeep into src/download_apk/bin/ instead,
+unless DOWNLOAD_APK_SKIP_APKEEP is set (the tests replace apkeep with a fake, so they don't need it).
 
 The metadata hook fills in the two fields pyproject.toml marks dynamic:
 
@@ -19,14 +27,15 @@ a wheel built from the tarball, as `python -m build` does, then matches one buil
 Without git or an `origin` remote, the build still works: without links, and dated 2020-02-02.
 The links follow GitHub's layout (/tree/, /blob/, /releases/tag/, /issues), so on other hosts some
 may not resolve.
-See "Reproducible builds" in README.md.
 """
 
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -36,6 +45,14 @@ from hatchling.metadata.plugin.interface import MetadataHookInterface
 
 # What the sdist build read from git, at the tarball's root.
 GIT_INFO_FILE = ".git-info.json"
+
+# The apkeep release compiled into the wheel. --locked builds it with the exact dependency versions and
+# checksums in its published Cargo.lock, and crates.io never lets a published version change.
+APKEEP_VERSION = "1.1.0"
+# Where the wheel holds it, relative to the package; src/download_apk/apkeep.py looks for it there.
+APKEEP_DIR = "bin"
+# Set to anything to skip compiling apkeep for an editable install.
+SKIP_APKEEP = "DOWNLOAD_APK_SKIP_APKEEP"
 
 # Git's scp-like remote syntax, [user@]host:path: a colon before the first slash, and no "://". The host
 # must be longer than one character, which tells it apart from a Windows drive letter (C:/repos/x).
@@ -112,6 +129,77 @@ def git_info(root: Path) -> dict:
     return {"commit_time": None, "repository": None}
 
 
+def wheel_platform_tag(platform: str) -> str:
+    """The wheel tag for a sysconfig.get_platform() name: macosx-11.0-arm64 -> macosx_11_0_arm64,
+    linux-x86_64 -> linux_x86_64 (which auditwheel then narrows to a manylinux tag), win-amd64 -> win_amd64."""
+    return platform.replace("-", "_").replace(".", "_")
+
+
+def apkeep_name(platform: str) -> str:
+    return "apkeep.exe" if platform.startswith("win") else "apkeep"
+
+
+def cargo_environment(environ: dict[str, str], platform: str, cargo_home: Path, target_dir: Path) -> dict[str, str]:
+    """The environment for `cargo install`: environ plus settings that make the binary small, and the
+    same bytes wherever it is built from the same toolchain.
+
+    - --remap-path-prefix rewrites the build machine's paths (the crates' sources under CARGO_HOME, the
+      target directory) that rustc embeds in panic messages, so the user name and folders don't leak
+      into the binary or change its bytes. CARGO_ENCODED_RUSTFLAGS separates flags with 0x1F, so a path
+      with spaces (C:\\Users\\Jane Doe\\.cargo) stays one flag; it takes precedence over RUSTFLAGS, so
+      RUSTFLAGS is carried over into it.
+    - /Brepro makes Microsoft's linker write a hash of the contents where it would write the time.
+    - Stripping symbols drops most of the binary's size.
+    - macOS: the wheel tag promises the oldest macOS the binary runs on, and rustc reads the same
+      promise from MACOSX_DEPLOYMENT_TARGET, so both come from the platform name.
+    """
+    env = dict(environ)
+    if env.get("CARGO_ENCODED_RUSTFLAGS"):
+        flags = env["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
+    else:
+        flags = env.get("RUSTFLAGS", "").split()
+    flags += [f"--remap-path-prefix={cargo_home}=/cargo", f"--remap-path-prefix={target_dir}=/target"]
+    if platform.startswith("win"):
+        flags.append("-Clink-arg=/Brepro")
+    env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(flags)
+    env.pop("RUSTFLAGS", None)
+    env.setdefault("CARGO_PROFILE_RELEASE_STRIP", "symbols")
+    if platform.startswith("macosx-"):
+        env.setdefault("MACOSX_DEPLOYMENT_TARGET", platform.split("-")[1])
+    return env
+
+
+def compile_apkeep(root_dir: Path, platform: str) -> Path:
+    """Compiles apkeep into root_dir/bin and returns the binary's path."""
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        raise RuntimeError(
+            "Building a download-apk wheel compiles apkeep, which needs Rust's cargo. Install Rust from "
+            "https://rustup.rs and build again, or install a prebuilt wheel from PyPI."
+        )
+    cargo_home = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo").resolve()
+    # Set CARGO_TARGET_DIR to keep compiled dependencies between builds; by default each build starts over.
+    target_dir = Path(os.environ.get("CARGO_TARGET_DIR") or root_dir / "target").resolve()
+    print(f"hatch_build: compiling apkeep {APKEEP_VERSION} with cargo, which takes a few minutes", file=sys.stderr)
+    subprocess.run(
+        [cargo, "install", f"apkeep@{APKEEP_VERSION}", "--locked", "--no-track",
+         "--root", str(root_dir), "--target-dir", str(target_dir)],
+        env=cargo_environment(dict(os.environ), platform, cargo_home, target_dir),
+        stdin=subprocess.DEVNULL, check=True,
+    )
+    return root_dir / "bin" / apkeep_name(platform)
+
+
+def apkeep_version(binary: Path) -> str | None:
+    """The version a compiled apkeep reports, or None if it is missing or doesn't run."""
+    try:
+        result = subprocess.run([str(binary), "--version"], capture_output=True, text=True,
+                                stdin=subprocess.DEVNULL, check=False)
+    except OSError:
+        return None
+    return result.stdout.split()[-1] if result.returncode == 0 and result.stdout.split() else None
+
+
 class CustomMetadataHook(MetadataHookInterface):
     def update(self, metadata: dict) -> None:
         version = metadata["version"]
@@ -142,3 +230,23 @@ class CustomBuildHook(BuildHookInterface):
             # Fixed key order and LF line endings, so the tarball's bytes don't depend on the OS.
             recorded.write_bytes(json.dumps(info, sort_keys=True).encode("utf-8") + b"\n")
             build_data["force_include"][str(recorded)] = GIT_INFO_FILE
+        elif self.target_name == "wheel":
+            self._bundle_apkeep(version, build_data)
+
+    def _bundle_apkeep(self, version: str, build_data: dict) -> None:
+        platform = sysconfig.get_platform()  # cibuildwheel points it at the target through _PYTHON_HOST_PLATFORM
+        name = apkeep_name(platform)
+        if version == "editable":
+            # An editable install imports the package from src/, so apkeep goes next to it there.
+            in_source = Path(self.root) / "src" / "download_apk" / APKEEP_DIR / name
+            if os.environ.get(SKIP_APKEEP):
+                print(f"hatch_build: {SKIP_APKEEP} is set; not compiling apkeep", file=sys.stderr)
+            elif apkeep_version(in_source) != APKEEP_VERSION:
+                binary = compile_apkeep(Path(tempfile.mkdtemp()), platform)
+                in_source.parent.mkdir(exist_ok=True)
+                shutil.copy2(binary, in_source)
+            return
+        binary = compile_apkeep(Path(tempfile.mkdtemp()), platform)
+        build_data["force_include"][str(binary)] = f"download_apk/{APKEEP_DIR}/{name}"
+        build_data["pure_python"] = False
+        build_data["tag"] = f"py3-none-{wheel_platform_tag(platform)}"

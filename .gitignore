@@ -16,3 +16,6 @@ dist/
 # IDE settings
 .idea/
 .vscode/
+
+# apkeep compiled by an editable install.
+src/download_apk/bin/

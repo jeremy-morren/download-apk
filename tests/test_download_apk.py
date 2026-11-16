@@ -122,6 +122,46 @@ def test_git_info_without_git_or_a_record(hatch_build, tmp_path):
     assert hatch_build.git_info(tmp_path) == {"commit_time": None, "repository": None}
 
 
+@pytest.mark.parametrize(
+    ("platform", "tag"),
+    [
+        ("macosx-11.0-arm64", "macosx_11_0_arm64"),
+        ("macosx-10.13-x86_64", "macosx_10_13_x86_64"),
+        ("linux-x86_64", "linux_x86_64"),
+        ("linux-aarch64", "linux_aarch64"),
+        ("win-amd64", "win_amd64"),
+        ("win-arm64", "win_arm64"),
+    ],
+)
+def test_wheel_platform_tag(hatch_build, platform, tag):
+    assert hatch_build.wheel_platform_tag(platform) == tag
+
+
+def test_cargo_environment_remaps_paths_and_keeps_existing_flags(hatch_build):
+    home, target = Path("/home/Jane Doe/.cargo"), Path("/tmp/b/target")
+    env = hatch_build.cargo_environment({"RUSTFLAGS": "-Copt-level=3 -Cdebuginfo=0"}, "linux-x86_64", home, target)
+    assert env["CARGO_ENCODED_RUSTFLAGS"].split("\x1f") == [
+        "-Copt-level=3", "-Cdebuginfo=0",
+        f"--remap-path-prefix={home}=/cargo",  # one flag, despite the space in the path
+        f"--remap-path-prefix={target}=/target",
+    ]
+    assert "RUSTFLAGS" not in env
+    assert env["CARGO_PROFILE_RELEASE_STRIP"] == "symbols"
+    assert "MACOSX_DEPLOYMENT_TARGET" not in env
+
+
+def test_cargo_environment_per_platform(hatch_build):
+    mac = hatch_build.cargo_environment({}, "macosx-11.0-arm64", Path("/c"), Path("/t"))
+    assert mac["MACOSX_DEPLOYMENT_TARGET"] == "11.0"
+    assert hatch_build.cargo_environment({"MACOSX_DEPLOYMENT_TARGET": "12.0"}, "macosx-11.0-arm64",
+                                         Path("/c"), Path("/t"))["MACOSX_DEPLOYMENT_TARGET"] == "12.0"
+    windows = hatch_build.cargo_environment({"CARGO_ENCODED_RUSTFLAGS": "-Ca\x1f-Cb"}, "win-arm64", Path("/c"), Path("/t"))
+    flags = windows["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
+    assert flags[:2] == ["-Ca", "-Cb"] and flags[-1] == "-Clink-arg=/Brepro"
+    assert hatch_build.apkeep_name("win-arm64") == "apkeep.exe"
+    assert hatch_build.apkeep_name("macosx-11.0-arm64") == "apkeep"
+
+
 def test_every_readme_link_resolves_on_pypi(hatch_build):
     """After the rewrite, every link in the published description is absolute or an in-page anchor."""
     readme = hatch_build.absolute_links((PYPROJECT.parent / "README.md").read_text(encoding="utf-8"), "https://x")
