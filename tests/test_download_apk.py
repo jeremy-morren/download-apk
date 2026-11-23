@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 import download_apk
-from download_apk import apk, cli, credentials, google_play, location
+from download_apk import apk, cli, credentials, google_play, jadx, location
 
 PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
 
@@ -502,9 +502,10 @@ def play(monkeypatch):
 
 def test_download_saves_under_app_and_version(tmp_path, play):
     play(FakeApkeep("2.4"))
-    google_play.download("com.example.app", tmp_path, tmp_path / "ini", "au", "en")
+    returned = google_play.download("com.example.app", tmp_path, tmp_path / "ini", "au", "en")
 
     version_dir = tmp_path / "com.example.app" / "2.4"
+    assert returned == version_dir
     assert sorted(p.name for p in version_dir.iterdir()) == [
         "com.example.app.apk", "com.example.app.config.arm64_v8a.apk", "metadata.json",
     ]
@@ -515,15 +516,17 @@ def test_download_saves_under_app_and_version(tmp_path, play):
 def test_download_skips_without_downloading_when_the_store_version_is_present(tmp_path, play):
     (tmp_path / "com.example.app" / "2.4").mkdir(parents=True)
     apkeep = play(FakeApkeep("2.4"), store_version="2.4")
-    google_play.download("com.example.app", tmp_path, tmp_path / "ini", "au", "en")
+    returned = google_play.download("com.example.app", tmp_path, tmp_path / "ini", "au", "en")
     assert apkeep.calls == 0
+    assert returned == tmp_path / "com.example.app" / "2.4"
 
 
 def test_download_discards_a_version_already_present(tmp_path, play, capsys):
     (tmp_path / "com.example.app" / "2.4").mkdir(parents=True)
     apkeep = play(FakeApkeep("2.4"), store_version=None)  # "Varies with device"
-    google_play.download("com.example.app", tmp_path, tmp_path / "ini", "au", "en")
+    returned = google_play.download("com.example.app", tmp_path, tmp_path / "ini", "au", "en")
     assert apkeep.calls == 1
+    assert returned == tmp_path / "com.example.app" / "2.4"
     assert "already downloaded" in capsys.readouterr().out
     assert [p.name for p in (tmp_path / "com.example.app").iterdir()] == ["2.4"]
 
@@ -539,6 +542,118 @@ def test_download_reports_a_refused_sign_in(tmp_path, play):
     play(FakeApkeep(version=None, stdout="Could not log in to Google Play.  Invalid payload.\n"))
     with pytest.raises(SystemExit, match="--sign-in"):
         google_play.download("com.example.app", tmp_path, tmp_path / "ini", "au", "en")
+
+
+# ------------------------------------------------------------------------------------------- jadx.py ---
+
+
+class FakeJadx:
+    """Stands in for subprocess.run of jadx: records the APKs it was given and writes a source file."""
+
+    def __init__(self, returncode: int = 0, writes: bool = True):
+        self.returncode, self.writes, self.inputs, self.args = returncode, writes, None, None
+
+    def __call__(self, cmd, cwd, **kwargs) -> subprocess.CompletedProcess:
+        self.args = cmd[1:]
+        out = Path(cwd) / cmd[cmd.index("--output-dir") + 1]
+        self.inputs = [Path(a).name for a in cmd[cmd.index("--output-dir") + 2:]]
+        assert all((Path(cwd) / a).is_file() for a in cmd[cmd.index("--output-dir") + 2:])
+        if self.writes:
+            (out / "sources").mkdir()
+            (out / "sources" / "Main.java").write_text("class Main {}")
+        return subprocess.CompletedProcess(cmd, self.returncode)
+
+
+@pytest.fixture
+def downloaded(tmp_path):
+    """A downloaded version, with a split whose name sorts before the base APK's."""
+    version_dir = tmp_path / "com.example.app" / "2.4"
+    version_dir.mkdir(parents=True)
+    for name in ["com.example.app.apk", "com.example.app.aaa.apk", "metadata.json"]:
+        (version_dir / name).write_bytes(b"")
+    return version_dir
+
+
+def test_find_jadx_fails_with_install_advice(monkeypatch):
+    monkeypatch.setattr(jadx.shutil, "which", lambda name: None)
+    with pytest.raises(SystemExit, match="Install jadx"):
+        jadx.find_jadx()
+
+
+def test_decompile_writes_beside_the_versions(monkeypatch, downloaded, capsys):
+    fake = FakeJadx()
+    monkeypatch.setattr(jadx.subprocess, "run", fake)
+    jadx.decompile("jadx", downloaded)
+
+    target = downloaded.parent / "decompiled" / "2.4"
+    assert (target / "sources" / "Main.java").is_file()
+    assert fake.inputs == ["com.example.app.apk", "com.example.app.aaa.apk"], "base APK first, no metadata"
+    assert [p.name for p in target.parent.iterdir()] == ["2.4"], "no staging left behind"
+
+
+def test_decompile_passes_jadx_nothing_cmd_exe_would_interpret(monkeypatch, tmp_path):
+    # On Windows jadx is jadx.bat, run through cmd.exe, which acts on & % ^ ! even inside quotes.
+    version_dir = tmp_path / "R&D %PATH% ^!" / "com.example.app" / apk.safe_dir_name("2.4 (beta&1)")
+    version_dir.mkdir(parents=True)
+    (version_dir / "com.example.app.apk").write_bytes(b"")
+    fake = FakeJadx()
+    monkeypatch.setattr(jadx.subprocess, "run", fake)
+    jadx.decompile("jadx", version_dir)
+
+    assert all(re.fullmatch(r"[\w.\-\\/]+", arg) for arg in fake.args), fake.args
+    assert (version_dir.parent / "decompiled" / version_dir.name / "sources").is_dir()
+
+
+def test_decompile_skips_a_version_already_decompiled(monkeypatch, downloaded, capsys):
+    (downloaded.parent / "decompiled" / "2.4").mkdir(parents=True)
+    monkeypatch.setattr(jadx.subprocess, "run", lambda *a, **k: pytest.fail("ran jadx again"))
+    jadx.decompile("jadx", downloaded)
+    assert "Already decompiled" in capsys.readouterr().out
+
+
+def test_decompile_keeps_output_when_jadx_reports_errors(monkeypatch, downloaded, capsys):
+    monkeypatch.setattr(jadx.subprocess, "run", FakeJadx(returncode=1))
+    jadx.decompile("jadx", downloaded)
+    assert (downloaded.parent / "decompiled" / "2.4" / "sources").is_dir()
+    assert "some code may be missing" in capsys.readouterr().out
+
+
+def test_decompile_that_produces_nothing_fails_and_leaves_nothing(monkeypatch, downloaded):
+    monkeypatch.setattr(jadx.subprocess, "run", FakeJadx(returncode=1, writes=False))
+    with pytest.raises(SystemExit, match="produced nothing"):
+        jadx.decompile("jadx", downloaded)
+    assert not (downloaded.parent / "decompiled").exists()
+
+
+def test_cli_checks_for_jadx_before_signing_in(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(jadx.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli, "ensure_signed_in", lambda *a: pytest.fail("signed in without jadx"))
+    with pytest.raises(SystemExit, match="Install jadx"):
+        cli.main(["download", "com.example.app", "--decompile"])
+
+
+@pytest.mark.parametrize("flag", [True, False], ids=["decompile", "download-only"])
+def test_cli_decompiles_the_downloaded_version(monkeypatch, tmp_path, flag):
+    monkeypatch.chdir(tmp_path)
+    version_dir = tmp_path / "apps" / "com.example.app" / "2.4"
+    decompiled = []
+    monkeypatch.setattr(cli, "find_jadx", lambda: "/bin/jadx" if flag else pytest.fail("looked for jadx without --decompile"))
+    monkeypatch.setattr(cli, "warn_if_tracked_by_git", lambda ini: None)
+    monkeypatch.setattr(cli, "ensure_signed_in", lambda *a: None)
+    monkeypatch.setattr(cli, "download", lambda *a: version_dir)
+    monkeypatch.setattr(cli, "decompile", lambda tool, path: decompiled.append((tool, path)))
+    cli.main(["--country", "us", "download", "com.example.app", *(["--decompile"] if flag else [])])
+    assert decompiled == ([("/bin/jadx", version_dir)] if flag else [])
+
+
+def test_cli_search_does_not_look_for_jadx(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(jadx.shutil, "which", lambda name: pytest.fail("looked for jadx during search"))
+    monkeypatch.setattr(cli, "warn_if_tracked_by_git", lambda ini: None)
+    monkeypatch.setattr(cli, "ensure_signed_in", lambda *a: None)
+    monkeypatch.setattr(cli, "search", lambda *a: None)
+    cli.main(["--country", "us", "search", "firefox"])
 
 
 # ------------------------------------------------------------------------------- google_play: search ---
