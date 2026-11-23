@@ -114,13 +114,14 @@ def _print_table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> None:
 
 
 # ----------------------------------------------------------------------------------------- download ---
-def download(app_id: str, out: Path, ini: Path, country: str, lang: str) -> None:
-    """Downloads the app's current version into out/<appId>/<version>/, unless that version is already there."""
+def download(app_id: str, out: Path, ini: Path, country: str, lang: str) -> Path:
+    """Downloads the app's current version into out/<appId>/<version>/, unless that version is already there.
+    Returns that folder either way."""
     app_dir = out / app_id
     listed = current_version(app_id, country, lang)
     if listed and (app_dir / safe_dir_name(listed)).exists():
         print(f"{app_id} {listed} (current on Google Play) already downloaded: {app_dir / safe_dir_name(listed)}")
-        return
+        return app_dir / safe_dir_name(listed)
 
     app_dir.mkdir(parents=True, exist_ok=True)
     staging: Path | None = Path(tempfile.mkdtemp(prefix=".partial-", dir=app_dir))
@@ -148,11 +149,12 @@ def download(app_id: str, out: Path, ini: Path, country: str, lang: str) -> None
         version_dir = app_dir / safe_dir_name(version)
         if version_dir.exists():
             print(f"{app_id} {version} already downloaded: {version_dir}")
-            return
+            return version_dir
         write_metadata(staging, app_id, version)
         staging.rename(version_dir)
         staging = None
         print(f"Saved {app_id} {version} to {version_dir}")
+        return version_dir
     finally:
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)

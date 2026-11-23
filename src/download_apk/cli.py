@@ -10,6 +10,7 @@ from pathlib import Path
 from . import __version__
 from .credentials import warn_if_tracked_by_git
 from .google_play import download, ensure_signed_in, search
+from .jadx import decompile, find_jadx
 from .location import detect_country, detect_language, language_tag
 
 DEFAULT_INI = ".google-play.ini"
@@ -90,6 +91,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("app_id", type=app_id_arg, help="the app's ID, e.g. com.example.app")
     p.add_argument("-o", "--out", type=Path, default=Path(os.environ.get(OUT_ENV) or DEFAULT_OUT),
                    help=f"output folder (default ${OUT_ENV} if set, else ./{DEFAULT_OUT})")
+    p.add_argument("--decompile", action="store_true",
+                   help="also decompile with jadx (from PATH) into <out>/<appId>/decompiled/<version>/")
     return parser
 
 
@@ -100,6 +103,8 @@ def main(argv: list[str] | None = None) -> None:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace")
     args = build_parser().parse_args(argv)
+    # Checked before signing in or downloading, so a missing jadx fails at once.
+    jadx = find_jadx() if args.command == "download" and args.decompile else None
     ini = args.ini.resolve()
     warn_if_tracked_by_git(ini)
     try:
@@ -109,7 +114,9 @@ def main(argv: list[str] | None = None) -> None:
         if args.command == "search":
             search(args.term, args.limit, country, language)
         else:
-            download(args.app_id, args.out.resolve(), ini, country, language)
+            version_dir = download(args.app_id, args.out.resolve(), ini, country, language)
+            if jadx:
+                decompile(jadx, version_dir)
     except urllib.error.URLError as error:
         sys.exit(f"Network error: {error.reason}")
     except KeyboardInterrupt:
